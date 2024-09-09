@@ -1,0 +1,241 @@
+import websocket
+import json
+import threading
+import time
+import hmac
+import hashlib
+import base64
+import requests
+
+# Kraken Futures WebSocket URL and API URLs
+ws_url = "wss://demo-futures.kraken.com/ws/v1"
+api_base_url = "https://demo-futures.kraken.com/api/v3"
+
+# Kraken Futures Testnet API credentials
+api_key = ''
+api_secret = ''
+
+# Initialize order book
+order_book = {
+    'bids': {},  # We'll store price levels as keys and quantities as values
+    'asks': {}
+}
+
+# Track open orders
+open_orders = {'buy': None, 'sell': None}
+
+# Market-making parameters
+maker_fee = 0.0016  # 0.16% maker fee on Kraken
+min_profitable_spread = 0.002  # Minimum spread to cover fees and make profit
+
+# Helper function to create the authentication signature for Kraken Futures API
+def generate_signature(secret, path, nonce, data):
+    message = path + str(nonce) + data
+    return hmac.new(secret.encode(), message.encode(), hashlib.sha256).hexdigest()
+
+# REST API: Send signed requests to Kraken Futures API
+def send_kraken_request(path, data, api_key, api_secret):
+    nonce = int(time.time() * 1000)
+    signature = generate_signature(api_secret, path, nonce, data)
+    headers = {
+        'APIKey': api_key,
+        'Authent': signature,
+        'Nonce': str(nonce),
+        'Content-Type': 'application/json'
+    }
+    response = requests.post(api_base_url + path, headers=headers, data=data)
+    return response.json()
+
+# WebSocket event handlers
+import websocket
+import json
+
+def on_message(ws, message):
+    """Process incoming WebSocket messages (order book updates)."""
+    try:
+        # Try parsing the message as JSON
+        data = json.loads(message)
+    except json.JSONDecodeError:
+        # If we get a non-JSON message, just print it and return
+        print("Non-JSON WebSocket message received, ignoring it:", message)
+        return
+
+    # Proceed with normal processing if JSON is valid
+    if data.get('feed') == 'book_snapshot':
+        # Process initial order book snapshot
+        process_order_book_snapshot(data)
+
+    elif data.get('feed') == 'book':
+        # Process incremental updates to the order book
+        process_order_book_update(data)
+
+def on_error(ws, error):
+    print(f"WebSocket error: {error}")
+
+def on_close(ws):
+    print("### WebSocket connection closed ###")
+
+def on_open(ws):
+    """Subscribe to the PI_XBTUSD order book when the connection opens."""
+    subscribe_message = {
+        "event": "subscribe",
+        "feed": "book",
+        "product_ids": ["PI_XBTUSD"]  # Bitcoin/USD futures contract
+    }
+    ws.send(json.dumps(subscribe_message))
+    print("Subscribed to PI_XBTUSD order book")
+
+# WebSocket connection starter
+def start_ws():
+    """Start the WebSocket connection in a separate thread."""
+    ws = websocket.WebSocketApp(ws_url,
+                                on_message=on_message,
+                                on_error=on_error,
+                                on_close=on_close)
+    ws.on_open = on_open
+    ws.run_forever()
+
+# Process the order book snapshot (full order book)
+def process_order_book_snapshot(data):
+    """Initialize order book with snapshot data."""
+    global order_book
+    order_book['bids'] = {float(entry['price']): float(entry['qty']) for entry in data['bids']}
+    order_book['asks'] = {float(entry['price']): float(entry['qty']) for entry in data['asks']}
+
+    print("Order book snapshot initialized.")
+    print_order_book()
+
+    # Trigger the market-making logic after initializing the order book
+    market_maker()
+
+# Process incremental updates to the order book
+def process_order_book_update(data):
+    """Update order book incrementally based on incoming updates."""
+    global order_book
+    price = float(data['price'])
+    qty = float(data['qty'])
+    side = data['side']
+
+    if side == 'buy':
+        if qty == 0.0:
+            # Remove price level if quantity is 0
+            if price in order_book['bids']:
+                del order_book['bids'][price]
+        else:
+            # Update bids
+            order_book['bids'][price] = qty
+
+    elif side == 'sell':
+        if qty == 0.0:
+            # Remove price level if quantity is 0
+            if price in order_book['asks']:
+                del order_book['asks'][price]
+        else:
+            # Update asks
+            order_book['asks'][price] = qty
+
+    print_order_book()
+
+    # Trigger the market-making logic after each update
+    market_maker()
+
+# Print the top levels of the order book (bids and asks)
+def print_order_book():
+    """Prints the top 5 bids and asks in the order book."""
+    sorted_bids = sorted(order_book['bids'].items(), key=lambda x: -x[0])[:5]
+    sorted_asks = sorted(order_book['asks'].items(), key=lambda x: x[0])[:5]
+
+    print("\n--- Top 5 Bids ---")
+    for price, qty in sorted_bids:
+        print(f"Bid: {price}, Qty: {qty}")
+
+    print("\n--- Top 5 Asks ---")
+    for price, qty in sorted_asks:
+        print(f"Ask: {price}, Qty: {qty}")
+    print("---------------------")
+
+# Market-making logic
+# Market-making logic
+def market_maker():
+    """Market-making logic based on the real-time order book."""
+    global open_orders
+
+    # Get the best bid and ask
+    if not order_book['bids'] or not order_book['asks']:
+        return  # No valid bids or asks yet
+
+    best_bid = max(order_book['bids'].keys())  # Highest bid
+    best_ask = min(order_book['asks'].keys())  # Lowest ask
+    actual_spread = best_ask - best_bid  # Difference between best ask and best bid
+
+    # Calculate the minimum profitable spread based on the maker fee
+    profitable_spread = 2 * (best_bid * maker_fee)  # Covers fees on both sides
+
+    # Print both the actual spread and the minimum profitable spread
+    print(f"\nBest Bid: {best_bid}, Best Ask: {best_ask}")
+    print(f"Actual Spread: {actual_spread}")
+    print(f"Profitable Spread: {profitable_spread}")
+
+    # Ensure spread is profitable after fees
+    if actual_spread > profitable_spread:
+        # Calculate target buy and sell prices
+        buy_price = best_bid + (actual_spread * 0.25)  # Slightly above best bid
+        sell_price = best_ask - (actual_spread * 0.25)  # Slightly below best ask
+        volume = 1  # Example: Trade 1 contract
+
+        # Place/adjust buy order
+        if not open_orders['buy']:
+            open_orders['buy'] = place_order('buy', buy_price, volume)
+        elif open_orders['buy'] and open_orders['buy']['price'] != buy_price:
+            cancel_order(open_orders['buy']['id'])
+            open_orders['buy'] = place_order('buy', buy_price, volume)
+
+        # Place/adjust sell order
+        if not open_orders['sell']:
+            open_orders['sell'] = place_order('sell', sell_price, volume)
+        elif open_orders['sell'] and open_orders['sell']['price'] != sell_price:
+            cancel_order(open_orders['sell']['id'])
+            open_orders['sell'] = place_order('sell', sell_price, volume)
+    else:
+        print(f"Spread {actual_spread} is too small to cover fees. No orders placed.")
+
+# Place order using Kraken Futures Testnet API
+def place_order(side, price, volume):
+    """Place a limit order on Kraken Futures Testnet."""
+    order_data = json.dumps({
+        'orderType': 'limit',
+        'symbol': "PI_XBTUSD",
+        'side': side,
+        'size': str(volume),
+        'limitPrice': str(price)
+    })
+    response = send_kraken_request('/orders', order_data, api_key, api_secret)
+    if response.get('error'):
+        print(f"Error placing {side} order: {response['error']}")
+        return None
+    else:
+        print(f"Placed {side} order: {response['result']['order_id']}")
+        return {'id': response['result']['order_id'], 'price': price}
+
+# Cancel an open order using Kraken Futures Testnet API
+def cancel_order(order_id):
+    """Cancel an open order on Kraken Futures Testnet."""
+    cancel_data = json.dumps({'order_id': order_id})
+    response = send_kraken_request('/cancel', cancel_data, api_key, api_secret)
+    if response.get('error'):
+        print(f"Error canceling order {order_id}: {response['error']}")
+    else:
+        print(f"Canceled order {order_id}")
+
+# Start WebSocket in a thread and run indefinitely
+if __name__ == "__main__":
+    # Start the WebSocket connection in a separate thread
+    ws_thread = threading.Thread(target=start_ws)
+    ws_thread.start()
+
+    # Keep the main thread alive
+    try:
+        while True:
+            time.sleep(1)  # Keep the program running
+    except KeyboardInterrupt:
+        print("Stopping market maker bot...")
